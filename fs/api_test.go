@@ -25,6 +25,7 @@ import (
 	"github.com/swiftstack/ProxyFS/ramswift"
 	"github.com/swiftstack/ProxyFS/stats"
 	"github.com/swiftstack/ProxyFS/swiftclient"
+	"github.com/swiftstack/ProxyFS/trackedlock"
 )
 
 // our global mountStruct to be used in tests
@@ -63,6 +64,10 @@ func testSetup() (err error) {
 		"Stats.BufferLength=100",
 		"Stats.MaxLatency=1s",
 		"Logging.LogFilePath=proxyfsd.log",
+
+		"TrackedLock.LockHoldTimeLimit=0s",
+		"TrackedLock.LockCheckPeriod=0s",
+
 		"SwiftClient.NoAuthTCPPort=45262",
 		"SwiftClient.Timeout=10s",
 		"SwiftClient.RetryLimit=5",
@@ -119,29 +124,36 @@ func testSetup() (err error) {
 	doneChan := make(chan bool, 1)
 	go ramswift.Daemon("/dev/null", testConfMapStrings, &signalHandlerIsArmed, doneChan, unix.SIGTERM)
 
-	err = stats.Up(testConfMap)
-	if nil != err {
-		return
-	}
-
 	err = logger.Up(testConfMap)
 	if nil != err {
 		stats.Down()
 		return
 	}
 
+	err = trackedlock.Up(testConfMap)
+	if nil != err {
+		return
+	}
+
+	err = stats.Up(testConfMap)
+	if nil != err {
+		return
+	}
+
 	err = dlm.Up(testConfMap)
 	if nil != err {
-		logger.Down()
 		stats.Down()
+		trackedlock.Down()
+		logger.Down()
 		return
 	}
 
 	err = swiftclient.Up(testConfMap)
 	if err != nil {
 		dlm.Down()
-		logger.Down()
 		stats.Down()
+		trackedlock.Down()
+		logger.Down()
 		return err
 	}
 
@@ -149,8 +161,9 @@ func testSetup() (err error) {
 	if nil != err {
 		swiftclient.Down()
 		dlm.Down()
-		logger.Down()
 		stats.Down()
+		trackedlock.Down()
+		logger.Down()
 		return
 	}
 
@@ -159,8 +172,9 @@ func testSetup() (err error) {
 		headhunter.Down()
 		swiftclient.Down()
 		dlm.Down()
-		logger.Down()
 		stats.Down()
+		trackedlock.Down()
+		logger.Down()
 		return
 	}
 
@@ -170,8 +184,9 @@ func testSetup() (err error) {
 		headhunter.Down()
 		swiftclient.Down()
 		dlm.Down()
-		logger.Down()
 		stats.Down()
+		trackedlock.Down()
+		logger.Down()
 		return
 	}
 
@@ -185,8 +200,9 @@ func testTeardown() (err error) {
 	headhunter.Down()
 	swiftclient.Down()
 	dlm.Down()
-	logger.Down()
 	stats.Down()
+	trackedlock.Down()
+	logger.Down()
 
 	testDir, err := os.Getwd()
 	if nil != err {
