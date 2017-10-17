@@ -11,26 +11,26 @@ func parseConfMap(confMap conf.ConfMap) (err error) {
 
 	globals.lockHoldTimeLimit, err = confMap.FetchOptionValueDuration("TrackedLock", "LockHoldTimeLimit")
 	if err != nil {
-		logger.Warnf("config variable 'TrackedLock.LockHoldTimeLImit' defaulting to '30s': %v", err)
-		globals.lockHoldTimeLimit = time.Duration(30 * time.Second)
+		logger.Warnf("config variable 'TrackedLock.LockHoldTimeLImit' defaulting to '0s': %v", err)
+		globals.lockHoldTimeLimit = time.Duration(0 * time.Second)
 	}
 
-	// lockHoldTimeLimit must be >= 1 sec
+	// lockHoldTimeLimit must be >= 1 sec or 0
 	if globals.lockHoldTimeLimit < time.Second && globals.lockHoldTimeLimit != 0 {
-		logger.Warnf("config variable 'TrackedLock.LockHoldTimeLImit' value less then 1 sec; defaulting to '30s'")
-		globals.lockHoldTimeLimit = time.Duration(30 * time.Second)
+		logger.Warnf("config variable 'TrackedLock.LockHoldTimeLImit' value less then 1 sec; defaulting to '40s'")
+		globals.lockHoldTimeLimit = time.Duration(40 * time.Second)
 	}
 
 	globals.lockCheckPeriod, err = confMap.FetchOptionValueDuration("TrackedLock", "LockCheckPeriod")
 	if err != nil {
-		logger.Warnf("config variable 'TrackedLock.LockCheckPeriod' defaulting to '10s': %v", err)
-		globals.lockCheckPeriod = time.Duration(10 * time.Second)
+		logger.Warnf("config variable 'TrackedLock.LockCheckPeriod' defaulting to '0s': %v", err)
+		globals.lockCheckPeriod = time.Duration(0 * time.Second)
 	}
 
-	// lockCheckPeriod must be >= 1 sec
+	// lockCheckPeriod must be >= 1 sec or 0
 	if globals.lockCheckPeriod < time.Second && globals.lockCheckPeriod != 0 {
-		logger.Warnf("config variable 'TrackedLock.LockCheckPeriod' value less then 1 sec; defaulting to '10s'")
-		globals.lockCheckPeriod = time.Duration(10 * time.Second)
+		logger.Warnf("config variable 'TrackedLock.LockCheckPeriod' value less then 1 sec; defaulting to '20s'")
+		globals.lockCheckPeriod = time.Duration(20 * time.Second)
 	}
 
 	err = nil
@@ -50,8 +50,8 @@ func Up(confMap conf.ConfMap) (err error) {
 		return
 	}
 
-	globals.mutexMap = make(map[*mutexTrack]interface{}, 128)
-	globals.rwMutexMap = make(map[*rwMutexTrack]interface{}, 128)
+	globals.mutexMap = make(map[*MutexTrack]interface{}, 128)
+	globals.rwMutexMap = make(map[*RWMutexTrack]interface{}, 128)
 	globals.stopChan = make(chan struct{})
 	globals.doneChan = make(chan struct{})
 
@@ -71,7 +71,7 @@ func Up(confMap conf.ConfMap) (err error) {
 
 func Down() (err error) {
 	// shutdown lock tracker
-	logger.Infof("statslogger.Down() called")
+	logger.Infof("tracklock.Down() called")
 	if globals.lockCheckTicker != nil {
 		globals.lockCheckTicker.Stop()
 		globals.lockCheckTicker = nil

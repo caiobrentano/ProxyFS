@@ -9,15 +9,20 @@ package trackedlock
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/swiftstack/ProxyFS/conf"
 	"github.com/swiftstack/ProxyFS/logger"
 )
 
-func TestAPI(t *testing.T) {
-	confStrings := []string{
+// Common configuration for all tests (unless overridden)
+//
+var (
+	confStrings = []string{
 		"TrackedLock.LockHoldTimeLimit=2s",
 		"TrackedLock.LockCheckPeriod=1s",
 
@@ -27,132 +32,513 @@ func TestAPI(t *testing.T) {
 		"Stats.MaxLatency=1s",
 	}
 
+	// matches: "trackedlock watcher: *trackedlock.Mutex at 0xc420110000 locked for 2 sec; stack at Lock() call:\ngoroutine 19 [running]:..."
+	watcherLogMatch = `^trackedlock watcher: (?P<type>[*a-zA-Z0-9_.]+) at (?P<ptr>0x[0-9a-f]+) locked for (?P<time>\d+) sec; stack at (?P<locker>[a-zA-Z0-9_()]+) call:\\n(?P<lockStack>.*)$`
+
+	// matches: "Unlock(): *trackedlock.Mutex at 0xc420110000 locked for 3 sec; stack at Lock() call:\ngoroutine 19 [running]:\n...\n stack at Unlock():\ngoroutine 19 [running]:\n..."
+	unlockLogMatch = `^Unlock\(\): (?P<type>[*a-zA-Z0-9_.]+) at (?P<ptr>0x[0-9a-f]+) locked for (?P<time>\d+) sec; stack at (?P<locker>[a-zA-Z0-9_()]+) call:\\n(?P<lockStack>.*) stack at Unlock\(\):\\n(?P<unlockStack>.*)$`
+
+	// matches: "RUnlock(): *trackedlock.RWMutex at 0xc420100000 locked for 5 sec; stack at RLock() call:\ngoroutine 5 [running]:\n...\n stack at RUnlock():\ngoroutine 5 [running]:\n..."
+	rUnlockLogMatch = `^RUnlock\(\): (?P<type>[*a-zA-Z0-9_.]+) at (?P<ptr>0x[0-9a-f]+) locked for (?P<time>\d+) sec; stack at (?P<locker>[a-zA-Z0-9_()]+) call:\\n(?P<lockStack>.*) stack at RUnlock\(\):\\n(?P<unlockStack>.*)$`
+
+	watcherLogRE = regexp.MustCompile(watcherLogMatch)
+	unlockLogRE  = regexp.MustCompile(unlockLogMatch)
+	rUnlockLogRE = regexp.MustCompile(rUnlockLogMatch)
+)
+
+// sleep for the requested number of seconds
+//
+func sleep(sec float64) {
+	var usec int64 = int64(sec * 1000 * 1000)
+	delay := time.Duration(usec) * time.Microsecond
+	time.Sleep(delay)
+}
+
+// basic tests of the API
+//
+func TestAPI(t *testing.T) {
 	confMap, err := conf.MakeConfMapFromStrings(confStrings)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
 
+	// Startup packages involved
 	err = logger.Up(confMap)
 	if nil != err {
 		tErr := fmt.Sprintf("logger.Up(confMap) failed: %v", err)
 		t.Fatalf(tErr)
 	}
 
-	// first test -- start with tracking disabled, then bring up enabled
 	err = Up(confMap)
 	if nil != err {
-		tErr := fmt.Sprintf("Up('TrackedLock.LockHoldTimeLimit=1s) failed: %v", err)
+		tErr := fmt.Sprintf("Up() failed: %v", err)
 		t.Fatalf(tErr)
 	}
+
+	// validate packge config variables
 	if globals.lockHoldTimeLimit != 2*time.Second {
-		t.Fatalf("after Up('TrackedLock.LockHoldTimeLimit=1s) globals.lockHoldTimeLimi != 2 sec")
+		t.Fatalf("after Up() globals.lockHoldTimeLimi != 2 sec")
 	}
 
-	// err = Down()
-	// if nil != err {
-	// 	tErr := fmt.Sprintf("Down() 'Trackedlock.Period=0s' failed: %v", err)
-	// 	t.Fatalf(tErr)
-	// }
+	// get a copy of what's written to the log
+	var logcopy logger.LogTarget
+	logcopy.Init(100)
+	logger.AddLogTarget(logcopy)
 
-	// err = confMap.UpdateFromString("Trackedlock.Period=1s")
-	// if nil != err {
-	// 	tErr := fmt.Sprintf("UpdateFromString('Trackedlock.Period=1s') failed: %v", err)
-	// 	t.Fatalf(tErr)
-	// }
-	// err = Up(confMap)
-	// if nil != err {
-	// 	tErr := fmt.Sprintf("trackedlock.Up(Trackedlock.Period=1s) failed: %v", err)
-	// 	t.Fatalf(tErr)
-	// }
-	// if globals.statsLogPeriod != 1*time.Second {
-	// 	t.Fatalf("after Up('Trackedlock.Period=1s') globals.statsLogPeriod != 1 sec")
-	// }
+	// basic tests
+	testMutexes(t, logcopy, confMap)
 
-	// Run the tests
-	//
-	// "Real" unit tests would verify the information written into the log
-	//
-	// t.Run("testRetry", testRetry)
-	// t.Run("testOps", testOps)
-	// testReload(t, confMap)
-	testMutex(t, confMap)
-
-	// Shutdown packages
-
+	// Shutdown packages, starting with this one
 	err = Down()
 	if nil != err {
-		tErr := fmt.Sprintf("Down() failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("TestAPI(): Down() failed: %v", err)
 	}
 
-	err = logger.Down()
-	if nil != err {
-		tErr := fmt.Sprintf("stats.Down() failed: %v", err)
-		t.Fatalf(tErr)
-	}
+	// skip shutdown of logger (until last test case finishes)
 }
 
-// Test trackedlock for Mutex
+// Test trackedlock for Mutex and RWMutex
 //
-func testMutex(t *testing.T, confMap conf.ConfMap) {
+func testMutexes(t *testing.T, logcopy logger.LogTarget, confMap conf.ConfMap) {
 	var (
-		testMutex Mutex
+		testMutex1   Mutex
+		testMutex2   Mutex
+		testMutex3   Mutex
+		testRWMutex1 RWMutex
+		testRWMutex2 RWMutex
 	)
 
-	// verify we can lock and unlock
-	testMutex.Lock()
-	testMutex.Unlock()
+	// verify we can lock and unlock some locks
+	testMutex1.Lock()
+	testMutex2.Lock()
+	testRWMutex1.Lock()
+	testRWMutex2.RLock()
+	testRWMutex2.RUnlock()
+	testRWMutex1.Unlock()
+	testMutex2.Unlock()
+	testMutex1.Unlock()
 
-	// verify hold limit detected
-	sleepTime, err := time.ParseDuration("3s")
+	// lock several locks for more than 3 sec; lock watcher should report
+	// the one held the longest. (the final sleep is 2.7 sec because the max
+	// hold time is 2 sec and the watcher runs every 1 sec.  3.0 sec is
+	// needed to insure that watcher has a chance to see the first lock but
+	// add an extra 0.1 sec to it has run and its output is visible.
+	testMutex1.Lock()
+	sleep(0.1)
+	testMutex2.Lock()
+	sleep(0.1)
+	testRWMutex1.RLock()
+	sleep(0.1)
+	testRWMutex2.Lock()
+	sleep(0.1)
+	testMutex3.Lock()
+	sleep(2.7)
+
+	// lockwatcher should have identified testMutex1 as the longest held mutex
+	fields, _, err := logger.ParseLogForFunc(logcopy, "lockWatcher", watcherLogRE, 3)
 	if err != nil {
-		tErr := fmt.Sprintf("ParseDuration('3s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Errorf("testMutex: could not find log entry for lockWatcher for testMutex1: %s", err.Error())
 	}
-	testMutex.Lock()
-	time.Sleep(sleepTime)
-	testMutex.Unlock()
+
+	ptr, _ := strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testMutex1)) {
+		t.Errorf("testMutex: testMutex1 is not the longest held Mutex")
+	}
+	if fields["type"] != "*trackedlock.Mutex" {
+		t.Errorf("testMutex: testMutex1 type reported as '%s' instead of '*trackedlock.Mutex'", fields["type"])
+	}
+
+	// release testMutex1 and look for the unlock message
+	testMutex1.Unlock()
+	sleep(0.1)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "unlockTrack", unlockLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for Mutex Unlock(): %s", err.Error())
+	}
+
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testMutex1)) {
+		t.Errorf("testMutex: testMutex1 was not the mutex unlocked")
+	}
+	if fields["type"] != "*trackedlock.Mutex" {
+		t.Errorf("testMutex: testMutex1 type reported as '%s' instead of '*trackedlock.Mutex'", fields["type"])
+	}
+
+	// after releasing testsMutex1 and waiting for the lockwatcher, it
+	// should now identify testMutex2 as the longest held mutex
+	sleep(1)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "lockWatcher", watcherLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for lockWatcher for testMutex2: %s", err.Error())
+	}
+
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testMutex2)) {
+		t.Errorf("testMutex: testMutex2 is not the longest held Mutex")
+	}
+	if fields["type"] != "*trackedlock.Mutex" {
+		t.Errorf("testMutex: testMutex2 type reported as '%s' instead of '*trackedlock.Mutex'", fields["type"])
+	}
+
+	// release testMutex2 and look for testRWMutex1 as the longest held
+	// RWMutex (in shared mode)
+	testMutex2.Unlock()
+	sleep(1.1)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "lockWatcher", watcherLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for lockWatcher for testRWMutex1: %s", err.Error())
+	}
+
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testRWMutex1)) {
+		t.Errorf("testMutex: testRWMutex1 is not the longest held Mutex")
+	}
+	if fields["locker"] != "RLock()" {
+		t.Errorf("testMutex: locker '%s' for testRWMutex1 is not 'Rlock()': %s",
+			fields["locker"], fields["msg"])
+	}
+	if fields["type"] != "*trackedlock.RWMutex" {
+		t.Errorf("testMutex: testRWMutex1 type reported as '%s' instead of '*trackedlock.RWMutex'",
+			fields["type"])
+	}
+
+	// release testRWMutex1 and look for the log message about it
+	testRWMutex1.RUnlock()
+	sleep(0.1)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "rUnlockTrack", rUnlockLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for testRWMutex1.RUnlock(): %s", err.Error())
+	}
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testRWMutex1)) {
+		t.Errorf("testMutex: testRWMutex1 was not the mutex unlocked")
+	}
+	if fields["type"] != "*trackedlock.RWMutex" {
+		t.Errorf("testMutex: testRWMutex1 type reported as '%s' instead of '*trackedlock.RWMutex'",
+			fields["type"])
+	}
+
+	// look for testRWMutex2 as the longest held RWMutex
+	sleep(1.0)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "lockWatcher", watcherLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for lockWatcher for testRWMutex2: %s", err.Error())
+	}
+
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testRWMutex2)) {
+		t.Errorf("testMutex: testRWMutex2 is not the longest held Mutex")
+	}
+	if fields["locker"] != "Lock()" {
+		t.Errorf("testMutex: locker '%s' for testRWMutex2 is not 'Rlock()': %s",
+			fields["locker"], fields["msg"])
+	}
+	if fields["type"] != "*trackedlock.RWMutex" {
+		t.Errorf("testMutex: testRWMutex2 type reported as '%s' instead of '*trackedlock.RWMutex'",
+			fields["type"])
+	}
+
+	// release testRWMutex2 and look for the log message about it
+	testRWMutex2.Unlock()
+	sleep(0.1)
+	fields, _, err = logger.ParseLogForFunc(logcopy, "unlockTrack", unlockLogRE, 3)
+	if err != nil {
+		t.Errorf("testMutex: could not find log entry for testRWMutex2.Unlock(): %s", err.Error())
+	}
+
+	ptr, _ = strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&testRWMutex2)) {
+		t.Errorf("testMutex: testRWMutex2 was not the mutex unlocked")
+	}
+	if fields["type"] != "*trackedlock.RWMutex" {
+		t.Errorf("testMutex: testRWMutex2 type reported as '%s' instead of '*trackedlock.RWMutex'",
+			fields["type"])
+	}
+
+	// release the last mutex but don't bother checking the messages
+	testMutex3.Unlock()
 }
 
-// Make sure we can shutdown and re-enable trackedlock
+func TestStartupShutdown(t *testing.T) {
+	// this succeeded the first time or we wouldn't be here, so don't check
+	// for errors
+	confMap, _ := conf.MakeConfMapFromStrings(confStrings)
+
+	// startup of logger was already done
+
+	// first test -- get some locks before lock tracking is initialized and
+	// then call Up(); test passes if nothing bad happens when they are
+	// released after Up() returns
+	var (
+		mutex1   Mutex
+		rwMutex1 RWMutex
+		rwMutex2 RWMutex
+		err      error
+	)
+	mutex1.Lock()
+	rwMutex1.Lock()
+	rwMutex2.RLock()
+
+	err = Up(confMap)
+	if err != nil {
+		tErr := fmt.Sprintf("TestStartupShutdown(): Up() failed: %v", err)
+		t.Fatalf(tErr)
+	}
+
+	// release the locks acquired before this package was "Up()"
+	mutex1.Unlock()
+	rwMutex1.Unlock()
+	rwMutex2.RUnlock()
+
+	// final test -- get some locks after lock tracking is initialized and
+	// then call Down() for it; test passes if nothing bad happens when they
+	// are released after Down() returns
+	mutex1.Lock()
+	rwMutex1.Lock()
+	rwMutex2.RLock()
+
+	// Shutdown this package
+	err = Down()
+	if nil != err {
+		t.Fatalf("Down() failed: %v", err)
+	}
+
+	// release the locks acquired before this package was "Up()"
+	mutex1.Unlock()
+	rwMutex1.Unlock()
+	rwMutex2.RUnlock()
+
+	// skip shutdown of logger (until last test case)
+}
+
+// Make sure we can reload trackedlock with new values
 //
-func testReload(t *testing.T, confMap conf.ConfMap) {
+// There are 3 possible states with 6 possible transitions, of which we're only
+// going to test 5.  The interesting states are:
+//
+//   T W  Description
+//   0 0  Lock tracking and lock watcher disabled
+//   1 0  Lock tracking enabled lock watcher disabled
+//   1 1  Lock tracking enabled and lock watcher enabled
+//
+// This test will go through the following states, acquiring locks in each of
+// states 0, 1, 2, and 3 and releasing them in states 1, 2, 3, 4.
+//
+// State T W  Description
+//   0   0 0  Lock tracking and lock watcher disabled
+//   1   1 0  Lock tracking enabled lock watcher disabled
+//   2   1 1  Lock tracking enabled and lock watcher enabled
+//   3   1 0  Lock tracking enabled lock watcher disabled
+//   4   0 0  Lock tracking and lock watcher disabled
+//   5   0 0  lock tracker shutdown
+//
+func TestReload(t *testing.T) {
 
 	var err error
 
-	// Reload trackedlock with logging disabled
-	err = confMap.UpdateFromString("Trackedlock.Period=0s")
+	// this succeeded the first time or we wouldn't get here
+	confMap, _ := conf.MakeConfMapFromStrings(confStrings)
+	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=0s")
 	if nil != err {
-		tErr := fmt.Sprintf("UpdateFromString('Trackedlock.Period=0s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("UpdateFromString('TrackedLock.LockCheckPeriod=0s') failed: %v", err)
+	}
+	err = confMap.UpdateFromString("TrackedLock.LockHoldTimeLimit=0s")
+	if nil != err {
+		t.Fatalf("UpdateFromString('TrackedLock.LockHoldTimeLimit=0s') failed: %v", err)
 	}
 
+	// bring the package up again
+	err = Up(confMap)
+	if err != nil {
+		t.Fatalf("TestReload(): Up() failed: %v", err)
+	}
+	if globals.lockCheckPeriod != 0 || globals.lockHoldTimeLimit != 0 {
+		t.Fatalf("TestReload(): Up() for state 0: lockCheckPeriod=%d or lockHoldTimeLimit=%d set incorrectly",
+			globals.lockCheckPeriod, globals.lockHoldTimeLimit)
+	}
+
+	// locks acquired in state 0
+	var (
+		mutex01, mutex02, mutex03, mutex04, mutex05           Mutex
+		rwMutex01, rwMutex02, rwMutex03, rwMutex04, rwMutex05 RWMutex
+	)
+	mutex01.Lock()
+	mutex02.Lock()
+	mutex03.Lock()
+	mutex04.Lock()
+	mutex05.Lock()
+	rwMutex01.RLock()
+	rwMutex02.RLock()
+	rwMutex03.RLock()
+	rwMutex04.RLock()
+	rwMutex05.RLock()
+
+	// transition to state 1 -- reload trackedlock with lock tracking enabled
+	err = confMap.UpdateFromString("TrackedLock.LockHoldTimeLimit=1s")
+	if nil != err {
+		t.Fatalf("UpdateFromString() for state 1 failed: %v", err)
+	}
 	err = PauseAndContract(confMap)
 	if nil != err {
-		tErr := fmt.Sprintf("PauseAndContract('Trackedlock.Period=0s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("PauseAndContract() for state 1 failed: %v", err)
 	}
 	err = ExpandAndResume(confMap)
 	if nil != err {
-		tErr := fmt.Sprintf("PauseAndContract('Trackedlock.Period=0s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("PauseAndContract() for state 1 failed: %v", err)
+	}
+	if globals.lockCheckPeriod != 0 || globals.lockHoldTimeLimit != time.Second {
+		t.Fatalf("TestReload(): ExpandAndResume() for state 1 didn't set variables")
 	}
 
-	// Enable logging again
-	err = confMap.UpdateFromString("Trackedlock.Period=1s")
+	// release locks for state 1
+	mutex01.Unlock()
+	rwMutex01.RUnlock()
+
+	// locks acquired in state 1
+	var (
+		mutex12, mutex13, mutex14, mutex15         Mutex
+		rwMutex12, rwMutex13, rwMutex14, rwMutex15 RWMutex
+	)
+	mutex12.Lock()
+	mutex13.Lock()
+	mutex14.Lock()
+	mutex15.Lock()
+	rwMutex12.RLock()
+	rwMutex13.RLock()
+	rwMutex14.RLock()
+	rwMutex15.RLock()
+
+	// transition to state 2 -- reload trackedlock with lock tracking and watching enabled
+	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=1s")
 	if nil != err {
-		tErr := fmt.Sprintf("UpdateFromString('Trackedlock.Period=1s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("UpdateFromString() for state 2 failed: %v", err)
 	}
-
 	err = PauseAndContract(confMap)
 	if nil != err {
-		tErr := fmt.Sprintf("PauseAndContract('Trackedlock.Period=1s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("PauseAndContract() for state 2 failed: %v", err)
 	}
 	err = ExpandAndResume(confMap)
 	if nil != err {
-		tErr := fmt.Sprintf("PauseAndContract('Trackedlock.Period=1s') failed: %v", err)
-		t.Fatalf(tErr)
+		t.Fatalf("PauseAndContract() for state 2 failed: %v", err)
 	}
+	if globals.lockCheckPeriod != time.Second || globals.lockHoldTimeLimit != time.Second {
+		t.Fatalf("TestReload(): ExpandAndResume() for state 2 didn't set variables")
+	}
+
+	// release locks for state 2
+	mutex02.Unlock()
+	mutex12.Unlock()
+	rwMutex02.RUnlock()
+	rwMutex12.RUnlock()
+
+	// locks acquired in state 2
+	var (
+		mutex23, mutex24, mutex25       Mutex
+		rwMutex23, rwMutex24, rwMutex25 RWMutex
+	)
+	mutex23.Lock()
+	mutex24.Lock()
+	mutex25.Lock()
+	rwMutex23.RLock()
+	rwMutex24.RLock()
+	rwMutex25.RLock()
+
+	// wait 2.1 sec so locks are held more than 1 sec and the lock watcher
+	// has a chance to run and take notice
+	sleep(2.1)
+
+	// transition to state 3 -- reload trackedlock with lock tracking and watching enabled
+	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=0s")
+	if nil != err {
+		t.Fatalf("UpdateFromString() for state 3 failed: %v", err)
+	}
+	err = PauseAndContract(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 3 failed: %v", err)
+	}
+	err = ExpandAndResume(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 3 failed: %v", err)
+	}
+	if globals.lockCheckPeriod != 0 || globals.lockHoldTimeLimit != time.Second {
+		t.Fatalf("TestReload(): ExpandAndResume() for state 3 didn't set variables")
+	}
+
+	// release locks for state 3
+	mutex03.Unlock()
+	mutex13.Unlock()
+	mutex23.Unlock()
+	rwMutex03.RUnlock()
+	rwMutex13.RUnlock()
+	rwMutex23.RUnlock()
+
+	// locks acquired in state 3
+	var (
+		mutex34, mutex35     Mutex
+		rwMutex34, rwMutex35 RWMutex
+	)
+	mutex34.Lock()
+	mutex35.Lock()
+	rwMutex34.RLock()
+	rwMutex35.RLock()
+
+	// transition to state 4 -- reload trackedlock with lock tracking and watching enabled
+	err = confMap.UpdateFromString("TrackedLock.LockHoldTimeLimit=0s")
+	if nil != err {
+		t.Fatalf("UpdateFromString() for state 4 failed: %v", err)
+	}
+	err = PauseAndContract(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 4 failed: %v", err)
+	}
+	err = ExpandAndResume(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 4 failed: %v", err)
+	}
+	if globals.lockCheckPeriod != 0 || globals.lockHoldTimeLimit != 0 {
+		t.Fatalf("TestReload(): ExpandAndResume() for state 4 didn't set variables")
+	}
+
+	// locks acquired in state 3
+	var (
+		mutex45   Mutex
+		rwMutex45 RWMutex
+	)
+	mutex45.Lock()
+	rwMutex45.RLock()
+
+	// release locks for state 4
+	mutex04.Unlock()
+	mutex14.Unlock()
+	mutex24.Unlock()
+	mutex34.Unlock()
+	rwMutex04.RUnlock()
+	rwMutex14.RUnlock()
+	rwMutex24.RUnlock()
+	rwMutex34.RUnlock()
+
+	// transition to state 5 -- shutdown this package
+	err = Down()
+	if nil != err {
+		t.Fatalf("Down() failed: %v", err)
+	}
+
+	// release locks for state 4
+	mutex05.Unlock()
+	mutex15.Unlock()
+	mutex25.Unlock()
+	mutex35.Unlock()
+	mutex45.Unlock()
+	rwMutex05.RUnlock()
+	rwMutex15.RUnlock()
+	rwMutex25.RUnlock()
+	rwMutex35.RUnlock()
+	rwMutex45.RUnlock()
+
+	// Shutdown other packages
+	err = logger.Down()
+	if nil != err {
+		t.Fatalf("stats.Down() failed: %v", err)
+	}
+
 }

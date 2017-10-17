@@ -1,7 +1,6 @@
 package trackedlock
 
 import (
-	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -12,89 +11,67 @@ import (
 
 type globalsStruct struct {
 	mapMutex          sync.Mutex                    // protects mutexMap and rwMutexMap
-	mutexMap          map[*mutexTrack]interface{}   // the Mutex like locks  being watched
-	rwMutexMap        map[*rwMutexTrack]interface{} // the RWMutex like locks being watched
+	mutexMap          map[*MutexTrack]interface{}   // the Mutex like locks  being watched
+	rwMutexMap        map[*RWMutexTrack]interface{} // the RWMutex like locks being watched
 	lockHoldTimeLimit time.Duration                 // locks held longer then this get logged
 	lockCheckPeriod   time.Duration                 // check locks once each period
 	lockCheckChan     <-chan time.Time              // wait here to check on locks
 	stopChan          chan struct{}                 // time to shutdown and go home
 	doneChan          chan struct{}                 // shutdown complete
 	lockCheckTicker   *time.Ticker                  // ticker for lock check time
+	dlmRWLockType     interface{}                   // set by a callback from the DLM code
 }
 
 var globals globalsStruct
 
-// stackTrace holds the stack trace of one thread.  stackTraceBuf is the storage
+// stackTraceSlice holds the stack trace of one thread.  stackTraceBuf is the storage
 // required to hold one stack trace.
 //
-type stackTrace []byte
+type stackTraceSlice []byte
 type stackTraceBuf [4040]byte
 
 // Track a Mutex or RWMutex held in exclusive mode (lockCnt is also used to
 // track the number of shared lockers)
 //
-type mutexTrack struct {
-	isWatched           bool          // true if lock is on list of checked mutexes
-	lockCnt             int           // 0 if unlocked, -1 locked exclusive, > 0 locked shared
-	lockTime            time.Time     // time last lock operation completed
-	lockerGoId          uint64        // goroutine ID of the last locker
-	lockerStackTrace    stackTrace    // stack trace of curent or last locker
-	lockerStackTraceBuf stackTraceBuf // reusable storage for stack trace
+type MutexTrack struct {
+	isWatched           bool            // true if lock is on list of checked mutexes
+	lockCnt             int             // 0 if unlocked, -1 locked exclusive, > 0 locked shared
+	lockTime            time.Time       // time last lock operation completed
+	lockerGoId          uint64          // goroutine ID of the last locker
+	lockerStackTrace    stackTraceSlice // stack trace of curent or last locker
+	lockerStackTraceBuf stackTraceBuf   // reusable storage for stack trace
 }
 
 // Track an RWMutex
 //
-type rwMutexTrack struct {
-	tracker           *mutexTrack           // tracking info when the lock is held exclusive
-	sharedStateLock   sync.Mutex            // lock the following fields (shared mode state)
-	rLockTime         map[uint64]time.Time  // GoId -> lock acquired time
-	rLockerStackTrace map[uint64]stackTrace // GoId -> locker stack trace
+type RWMutexTrack struct {
+	tracker           MutexTrack                 // tracking info when the lock is held exclusive
+	sharedStateLock   sync.Mutex                 // lock the following fields (shared mode state)
+	rLockTime         map[uint64]time.Time       // GoId -> lock acquired time
+	rLockerStackTrace map[uint64]stackTraceSlice // GoId -> locker stack trace
 }
 
-// RWMutex supports this interface, so we need to wrap DLM locks with the same
-// interface to reuse the same tracking code.
-//
-type rwLocker interface {
-	Lock()
-	Unlock()
-	RLock()
-	RUnlock()
-}
-
-// Locking a Mutex or locking an RWMutex in exclusive (writer) mode.
+// Locking a Mutex or an RWMutex in exclusive (writer) mode.  If this an
+// Mutex-like lock then rwmt is nil, otherwise it points to the RWMutexTrack.
 //
 // Note that holding an RWMutex in exclusive mode insures that no goroutine
 // holds it in shared mode.
 //
-func (mt *mutexTrack) Lock(wrappedMutex sync.Locker, wrapPtr interface{}) {
+func (mt *MutexTrack) lockTrack(wrappedLock interface{}, rwmt *RWMutexTrack) {
 
 	// if lock tracking is disabled, just get the lock and record the
 	// current time (time.Now() is kind've expensive, but may still be worth
 	// getting)
 	if globals.lockHoldTimeLimit == 0 {
-		wrappedMutex.Lock()
-
 		mt.lockTime = time.Now()
 		mt.lockCnt = -1
 		return
 	}
 
-	// mt.lockCnt is just a hint, but if the lock is locked then let's
-	// collect our stack trace now, even though this requires memory
-	// allocation
-	if mt.lockCnt != 0 {
-		stackTrace := make([]byte, 4040, 4040)
-		cnt := runtime.Stack(stackTrace, false)
+	mt.lockerStackTrace = mt.lockerStackTraceBuf[:]
+	cnt := runtime.Stack(mt.lockerStackTrace, false)
+	mt.lockerStackTrace = mt.lockerStackTrace[0:cnt]
 
-		wrappedMutex.Lock()
-		mt.lockerStackTrace = stackTrace[0:cnt]
-	} else {
-
-		wrappedMutex.Lock()
-		mt.lockerStackTrace = mt.lockerStackTraceBuf[:]
-		cnt := runtime.Stack(mt.lockerStackTrace, false)
-		mt.lockerStackTrace = mt.lockerStackTrace[0:cnt]
-	}
 	mt.lockerGoId = utils.StackTraceToGoId(mt.lockerStackTrace)
 	mt.lockTime = time.Now()
 	mt.lockCnt = -1
@@ -105,16 +82,10 @@ func (mt *mutexTrack) Lock(wrappedMutex sync.Locker, wrapPtr interface{}) {
 	if !mt.isWatched && globals.lockCheckPeriod != 0 && globals.lockHoldTimeLimit != 0 {
 		globals.mapMutex.Lock()
 
-		switch lockPtr := wrapPtr.(type) {
-		case *Mutex:
-			globals.mutexMap[mt] = wrapPtr
-		case *RWMutex:
-			globals.rwMutexMap[&lockPtr.rwTracker] = wrapPtr
-		case *RWLockStruct:
-			globals.rwMutexMap[&lockPtr.rwTracker] = wrapPtr
-		default:
-			errstring := fmt.Errorf("lock has an unknown type")
-			logger.PanicfWithError(errstring, "mutex type lock at %p", wrapPtr)
+		if rwmt != nil {
+			globals.rwMutexMap[rwmt] = wrappedLock
+		} else {
+			globals.mutexMap[mt] = wrappedLock
 		}
 		globals.mapMutex.Unlock()
 		mt.isWatched = true
@@ -125,59 +96,43 @@ func (mt *mutexTrack) Lock(wrappedMutex sync.Locker, wrapPtr interface{}) {
 
 // Unlocking a Mutex or unlocking an RWMutex held in exclusive (writer) mode
 //
-func (mt *mutexTrack) Unlock(wrappedMutex sync.Locker, wrapPtr interface{}) {
-
+func (mt *MutexTrack) unlockTrack(wrappedLock interface{}) {
 	if globals.lockHoldTimeLimit == 0 {
 		mt.lockCnt = 0
-		wrappedMutex.Unlock()
 		return
 	}
 
 	now := time.Now()
 	if now.Sub(mt.lockTime) >= globals.lockHoldTimeLimit {
 
-		var mutexType string
-		switch wrapPtr.(type) {
-		case *Mutex:
-			mutexType = "Mutex"
-		case *RWMutex:
-			mutexType = "RWMutex"
-		case *RWLockStruct:
-			mutexType = "RWLockStruct"
-		default:
-			errstring := fmt.Errorf("lock has an unknown type: '%T'", wrapPtr)
-			logger.PanicfWithError(errstring, "mutex type lock at %p", wrapPtr)
-		}
-
 		var buf stackTraceBuf
 		stackTrace := buf[:]
 		cnt := runtime.Stack(stackTrace, false)
-		stackTraceString := string(stackTrace[0:cnt])
+		stackTrace = stackTrace[0:cnt]
 
-		logger.Warnf("Unlock(): %s at %p locked for %d sec; stack at Lock() call: %s  stack at Unlock(): %s",
-			mutexType, wrapPtr,
-			now.Sub(mt.lockTime)/time.Second, string(mt.lockerStackTrace), stackTraceString)
+		logger.Warnf("Unlock(): %T at %p locked for %d sec; stack at Lock() call:\n%s stack at Unlock():\n%s",
+			wrappedLock, wrappedLock,
+			now.Sub(mt.lockTime)/time.Second, string(mt.lockerStackTrace), string(stackTrace))
 	}
 
 	// release the lock
 	mt.lockCnt = 0
-	wrappedMutex.Unlock()
 	return
 }
 
-// Tracking a RWMutex locked exclusive is just like a regular Mutex
+// Tracking an RWMutex locked exclusive is just like a regular Mutex
 //
-func (rwmt *rwMutexTrack) Lock(wrappedMutex sync.Locker, wrapPtr interface{}) {
-	rwmt.tracker.Lock(wrappedMutex, wrapPtr)
+func (rwmt *RWMutexTrack) lockTrack(wrappedLock interface{}) {
+	rwmt.tracker.lockTrack(wrappedLock, rwmt)
 }
 
-func (rwmt *rwMutexTrack) Unlock(wrappedMutex sync.Locker, wrapPtr interface{}) {
-	rwmt.tracker.Unlock(wrappedMutex, wrapPtr)
+func (rwmt *RWMutexTrack) unlockTrack(wrappedLock interface{}) {
+	rwmt.tracker.unlockTrack(wrappedLock)
 }
 
-// Tracking a RWMutex locked shared is more work
+// Tracking an RWMutex locked shared is more work
 //
-func (rwmt *rwMutexTrack) RLock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
+func (rwmt *RWMutexTrack) rLockTrack(wrappedLock interface{}) {
 
 	// if lock tracking is disabled, just get the lock and record the
 	// current time (time.Now() is kind've expensive, still probably
@@ -187,7 +142,9 @@ func (rwmt *rwMutexTrack) RLock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
 	// updated when the locks is acquired shared and mt.lockCnt is not being
 	// updated.
 	if globals.lockHoldTimeLimit == 0 {
-		wrappedRWMutex.RLock()
+		rwmt.sharedStateLock.Lock()
+		rwmt.tracker.lockCnt += 1
+		rwmt.sharedStateLock.Unlock()
 
 		rwmt.tracker.lockTime = time.Now()
 		return
@@ -201,13 +158,15 @@ func (rwmt *rwMutexTrack) RLock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
 	stackTrace = stackTrace[0:cnt]
 	goId := utils.StackTraceToGoId(stackTrace)
 
-	wrappedRWMutex.RLock()
-
 	// The lock is held as a reader (shared mode) so no goroutine can have
 	// it locked exclusive.  Holding rwmt.sharedStateLock is sufficient to
 	// insure that no other goroutine is changing rwmt.tracker.lockCnt.
 	rwmt.sharedStateLock.Lock()
 
+	if rwmt.rLockerStackTrace == nil {
+		rwmt.rLockerStackTrace = make(map[uint64]stackTraceSlice)
+		rwmt.rLockTime = make(map[uint64]time.Time)
+	}
 	rwmt.rLockerStackTrace[goId] = stackTrace
 	rwmt.rLockTime[goId] = time.Now()
 	rwmt.tracker.lockCnt += 1
@@ -216,7 +175,7 @@ func (rwmt *rwMutexTrack) RLock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
 	if !rwmt.tracker.isWatched && globals.lockCheckPeriod != 0 && globals.lockHoldTimeLimit != 0 {
 
 		globals.mapMutex.Lock()
-		globals.rwMutexMap[rwmt] = wrapPtr
+		globals.rwMutexMap[rwmt] = wrappedLock
 		globals.mapMutex.Unlock()
 		rwmt.tracker.isWatched = true
 	}
@@ -225,11 +184,12 @@ func (rwmt *rwMutexTrack) RLock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
 	return
 }
 
-func (rwmt *rwMutexTrack) RUnlock(wrappedRWMutex rwLocker, wrapPtr interface{}) {
+func (rwmt *RWMutexTrack) rUnlockTrack(wrappedLock interface{}) {
 
 	if globals.lockHoldTimeLimit == 0 {
+		rwmt.sharedStateLock.Lock()
 		rwmt.tracker.lockCnt -= 1
-		wrappedRWMutex.RUnlock()
+		rwmt.sharedStateLock.Unlock()
 		return
 	}
 
@@ -238,16 +198,18 @@ func (rwmt *rwMutexTrack) RUnlock(wrappedRWMutex rwLocker, wrapPtr interface{}) 
 
 	rwmt.sharedStateLock.Lock()
 
-	if now.Sub(rwmt.rLockTime[goId]) >= globals.lockHoldTimeLimit {
+	rLockTime, ok := rwmt.rLockTime[goId]
+	if ok && now.Sub(rLockTime) >= globals.lockHoldTimeLimit {
 
 		var buf stackTraceBuf
 		stackTrace := buf[:]
 		cnt := runtime.Stack(stackTrace, false)
-		stackTraceString := string(stackTrace[0:cnt])
+		stackTrace = stackTrace[0:cnt]
 
-		logger.Warnf("RUnlock(): RWMutex at %p locked for %d sec; stack at Lock() call: %s  stack at RUnlock(): %s",
-			wrapPtr, now.Sub(rwmt.rLockTime[goId])/time.Second,
-			rwmt.rLockerStackTrace[goId], stackTraceString)
+		logger.Warnf(
+			"RUnlock(): %T at %p locked for %d sec; stack at RLock() call:\n%s stack at RUnlock():\n%s",
+			wrappedLock, wrappedLock, now.Sub(rLockTime)/time.Second,
+			rwmt.rLockerStackTrace[goId], string(stackTrace))
 	}
 
 	delete(rwmt.rLockerStackTrace, goId)
@@ -255,25 +217,24 @@ func (rwmt *rwMutexTrack) RUnlock(wrappedRWMutex rwLocker, wrapPtr interface{}) 
 	rwmt.tracker.lockCnt -= 1
 	rwmt.sharedStateLock.Unlock()
 
-	// release the lock
-	wrappedRWMutex.RUnlock()
 	return
 }
 
 func lockWatcher() {
-	for {
+	for shutdown := false; !shutdown; {
 		select {
 		case <-globals.stopChan:
+			shutdown = true
 			logger.Infof("trackedlock lock watcher shutting down")
-			globals.doneChan <- struct{}{}
+			// fall through and perform one last check
 
 		case <-globals.lockCheckChan:
 			// fall through and perform checks
 		}
 
 		var (
-			longestMT       *mutexTrack
-			longestRWMT     *rwMutexTrack
+			longestMT       *MutexTrack
+			longestRWMT     *RWMutexTrack
 			longestDuration time.Duration
 			longestGoId     uint64
 		)
@@ -342,12 +303,11 @@ func lockWatcher() {
 			continue
 		}
 
-		// figure out the lock type, call type, stack trace, etc.
+		// figure out the call type, stack trace, etc.
 		var (
-			mutexType  string
-			lockCall   string
-			stackTrace string
-			lockPtr    interface{}
+			lockCall      string
+			stackTraceStr string
+			lockPtr       interface{}
 		)
 
 		// looking at tracker.lockerStackTrace is not strictly
@@ -357,22 +317,21 @@ func lockWatcher() {
 		// the lock is still locked before printing
 		switch {
 		case longestMT != nil:
-			mutexType = "Mutex"
 			lockCall = "Lock()"
-			stackTrace = string(longestMT.lockerStackTrace)
+			stackTraceStr = string(longestMT.lockerStackTrace)
 			lockPtr = globals.mutexMap[longestMT]
 		case longestGoId == 0:
-			mutexType = "RWMutex"
 			lockCall = "Lock()"
-			stackTrace = string(longestRWMT.tracker.lockerStackTrace)
+			stackTraceStr = string(longestRWMT.tracker.lockerStackTrace)
 			lockPtr = globals.rwMutexMap[longestRWMT]
 		default:
-			mutexType = "RWMutex"
 			lockCall = "RLock()"
-			stackTrace = string(longestRWMT.rLockerStackTrace[longestGoId])
+			stackTraceStr = string(longestRWMT.rLockerStackTrace[longestGoId])
 			lockPtr = globals.rwMutexMap[longestRWMT]
 		}
-		logger.Warnf("trackedlock watcher: %s at %p locked for %d sec; stack at %s call: %s",
-			mutexType, lockPtr, uint64(longestDuration/time.Second), lockCall, stackTrace)
+		logger.Warnf("trackedlock watcher: %T at %p locked for %d sec; stack at %s call:\n%s",
+			lockPtr, lockPtr, uint64(longestDuration/time.Second), lockCall, stackTraceStr)
 	}
+
+	globals.doneChan <- struct{}{}
 }
