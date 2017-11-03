@@ -334,6 +334,11 @@ func TestStartupShutdown(t *testing.T) {
 //
 func TestReload(t *testing.T) {
 
+	// get a copy of what's written to the log
+	var logcopy logger.LogTarget
+	logcopy.Init(100)
+	logger.AddLogTarget(logcopy)
+
 	var err error
 
 	// this succeeded the first time or we wouldn't get here
@@ -409,7 +414,7 @@ func TestReload(t *testing.T) {
 	rwMutex15.RLock()
 
 	// transition to state 2 -- reload trackedlock with lock tracking and watching enabled
-	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=1s")
+	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=2s")
 	if nil != err {
 		t.Fatalf("UpdateFromString() for state 2 failed: %v", err)
 	}
@@ -421,7 +426,7 @@ func TestReload(t *testing.T) {
 	if nil != err {
 		t.Fatalf("PauseAndContract() for state 2 failed: %v", err)
 	}
-	if globals.lockCheckPeriod != time.Second || globals.lockHoldTimeLimit != time.Second {
+	if globals.lockCheckPeriod != 2*time.Second || globals.lockHoldTimeLimit != time.Second {
 		t.Fatalf("TestReload(): ExpandAndResume() for state 2 didn't set variables")
 	}
 
@@ -443,9 +448,42 @@ func TestReload(t *testing.T) {
 	rwMutex24.RLock()
 	rwMutex25.RLock()
 
+	// change the lock watcher interval to 1 sec and verify locks aren't
+	// forgotten
+	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=1s")
+	if nil != err {
+		t.Fatalf("UpdateFromString() for state 2 failed: %v", err)
+	}
+	err = PauseAndContract(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 2 failed: %v", err)
+	}
+	err = ExpandAndResume(confMap)
+	if nil != err {
+		t.Fatalf("PauseAndContract() for state 2 failed: %v", err)
+	}
+	if globals.lockCheckPeriod != time.Second || globals.lockHoldTimeLimit != time.Second {
+		t.Fatalf("TestReload(): ExpandAndResume() for state 2 didn't set variables")
+	}
+
 	// wait 2.1 sec so locks are held more than 1 sec and the lock watcher
 	// has a chance to run and take notice
 	sleep(2.1)
+
+	// mutex23 was the first lock acquired after enabling the lock watcher,
+	// so it should report it
+	fields, _, err := logger.ParseLogForFunc(logcopy, "lockWatcher", watcherLogRE, 3)
+	if err != nil {
+		t.Errorf("TestReload(): could not find log entry for lockWatcher: %s", err.Error())
+	}
+
+	ptr, _ := strconv.ParseUint(fields["ptr"], 0, 64)
+	if uintptr(ptr) != uintptr(unsafe.Pointer(&mutex23)) {
+		t.Errorf("TestReload(): mutex23 is not the longest held Mutex")
+	}
+	if fields["type"] != "*trackedlock.Mutex" {
+		t.Errorf("TestReload(): mutex23 type reported as '%s' instead of '*trackedlock.Mutex'", fields["type"])
+	}
 
 	// transition to state 3 -- reload trackedlock with lock tracking and watching enabled
 	err = confMap.UpdateFromString("TrackedLock.LockCheckPeriod=0s")

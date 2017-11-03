@@ -167,8 +167,9 @@ func (rwmt *RWMutexTrack) rLockTrack(wrappedLock interface{}) {
 		rwmt.rLockerStackTrace = make(map[uint64]stackTraceSlice)
 		rwmt.rLockTime = make(map[uint64]time.Time)
 	}
+	rwmt.tracker.lockTime = time.Now()
+	rwmt.rLockTime[goId] = rwmt.tracker.lockTime
 	rwmt.rLockerStackTrace[goId] = stackTrace
-	rwmt.rLockTime[goId] = time.Now()
 	rwmt.tracker.lockCnt += 1
 
 	// add to the list of watched mutexes if anybody is watching
@@ -248,7 +249,15 @@ func lockWatcher() {
 		// as well, though go doesn't guarantee that).
 		globals.mapMutex.Lock()
 		for mt, _ := range globals.mutexMap {
+
+			// If the lock is not locked then skip it If it has been idle
+			// for the lockCheckPeriod then drop it from the locks being
+			// watched.
 			if mt.lockCnt == 0 {
+				lastLocked := now.Sub(mt.lockTime)
+				if lastLocked >= globals.lockCheckPeriod {
+					delete(globals.mutexMap, mt)
+				}
 				continue
 			}
 			lockedDuration := now.Sub(mt.lockTime)
@@ -270,7 +279,16 @@ func lockWatcher() {
 		// get rtracker.sharedStateLock for each lock.
 		globals.mapMutex.Lock()
 		for rwmt, _ := range globals.rwMutexMap {
+
+			// If the lock is not locked then skip it.  If it has been
+			// idle for the lockCheckPeriod (rwmt.tracker.lockTime is
+			// updated when the lock is locked shared or exclusive) then
+			// drop it from the locks being watched.
 			if rwmt.tracker.lockCnt == 0 {
+				lastLocked := now.Sub(rwmt.tracker.lockTime)
+				if lastLocked >= globals.lockCheckPeriod {
+					delete(globals.rwMutexMap, rwmt)
+				}
 				continue
 			}
 
